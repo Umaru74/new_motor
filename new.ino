@@ -8,72 +8,141 @@
 
 #include "ClearCore.h"
 #define motor1 ConnectorM0
+#define motor2 ConnectorM1
+#define motor3 ConnectorM2
+#define motor4 ConnectorM3
 
-#define MOTOR_COUNT 1
+int MOTOR_COUNT = 0; // Run-time motor count 
+
 
 #define SerialPort ConnectorUsb
 
-// Group connectors into an array for the [i] loops, this is for 1 motor, M-0 
-MotorDriver *motors[] = {&motor1};
+// --- Full pool of all 4 connectors ---
+MotorDriver *motorPool[] = {&motor1, &motor2, &motor3, &motor4};
+
+// --- Active motors array (pointer into motorPool, sized at runtime) ---
+// We declare the max size statically; only [0..MOTOR_COUNT-1] are used.
+MotorDriver *motors[4] = {nullptr, nullptr, nullptr, nullptr};
 
 // Hardware Constants
 const int32_t encoderResolution = 8000; // Counts per revolution (set to match MSP) , 8000 RPM CAP for step/dir mode
-const int32_t velocityRPM = 2000; // Target RPM 
-const int32_t velocityMAX = 2000; // max RPM
+const int32_t velocityRPM = 1000; // Target RPM 
+const int32_t velocityMAX = 1000; // max RPM
 const uint32_t accelerationLimit = 300; // RPM / sec^2
 const uint32_t decelerationLimit = 300; // RPM / sec^2
-const int32_t homingVelocity = -300; // move negative toward hard stop
+const int32_t homingVelocity = 300; // move negative toward hard stop
 const int32_t exitHomingMove = 200; // Distance to move away to exit homing mode
 const int32_t baudRate = 115200; // Communication speed for USB, baudRate needs to match with the host computer, monitor
 
 bool isRotating = false; // Global flag to see if motors are at the desired speed (not ramping)
 
 // Define phase offsets in degree, corresponding to motor 0, 1 (+ve goes CCW , -ve goes CW)
-const int32_t offsets[] = {-90};
+const int32_t offsets[] = {0, 90, 180, 270};
 
 // Define specific motor location to move to (such as when to close the valve for emergency)
-const int32_t targets[] = {180}; // in degree with respect to the motor 0, initial location
+const int32_t targets[] = {0, 0, 0, 0}; // in degree with respect to the motor 0, initial location
 
-// Function: Check if the motor is stationary or rotating 
-bool AreMotorsStationary() {
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        // StepsActive is true if the motor is currently executing a move pulses [1]
-        if (motors[i]->StatusReg().bit.StepsActive) {
-            return false; 
+
+// -----------------------------------------------------------------------
+// Startup: Ask the user how many motors to activate (1-4)
+// -----------------------------------------------------------------------
+void PromptMotorCount() {
+    SerialPort.SendLine("==============================================");
+    SerialPort.SendLine("  ClearCore Motor Controller - Startup");
+    SerialPort.SendLine("==============================================");
+    SerialPort.SendLine("How many motors will you be testing? (Enter 1, 2, 3, or 4)");
+
+    char response = 0;
+    while (true) {
+        if (SerialPort.AvailableForRead() > 0) {
+            response = SerialPort.CharGet();
+
+            // Accept '1' through '4' only
+            if (response >= '1' && response <= '4') {
+                MOTOR_COUNT = response - '0'; // Convert ASCII char to integer
+                break;
+            } else {
+                SerialPort.Send("Invalid input '");
+                SerialPort.Send(response);
+                SerialPort.SendLine("'. Please enter 1, 2, 3, or 4.");
+            }
         }
+        Delay_ms(10);
     }
-    return true; 
+
+    // Populate the active motors[] array from the pool
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        motors[i] = motorPool[i];
+    }
+
+    SerialPort.Send("Motor count set to: ");
+    SerialPort.SendLine(MOTOR_COUNT);
+    SerialPort.Send("Active connectors: M0");
+    for (int i = 1; i < MOTOR_COUNT; i++) {
+        SerialPort.Send(", M");
+        SerialPort.Send(i);
+    }
+    SerialPort.SendLine("");
 }
 
-// Function: Synchronize each motor individually with user confirmation
+// -----------------------------------------------------------------------
+// Configure acceleration, velocity limits for each active motor
+// -----------------------------------------------------------------------
+void ConfigureMotors() {
+    int32_t accelStepsPerSec_2  = (encoderResolution * accelerationLimit) / 60;
+    int32_t velmaxStepsPerSec   = (encoderResolution * velocityMAX) / 60;
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        motors[i]->AccelMax(accelStepsPerSec_2);
+        motors[i]->VelMax(velmaxStepsPerSec);
+        motors[i]->HlfbMode(MotorDriver::HLFB_MODE_STATIC);
+
+        SerialPort.Send("  Motor M");
+        SerialPort.Send(i);
+        SerialPort.Send(" configured: accel=");
+        SerialPort.Send(accelerationLimit);
+        SerialPort.Send(" RPM/s^2, velMax=");
+        SerialPort.Send(velocityMAX);
+        SerialPort.SendLine(" RPM");
+    }
+}
+
+// -----------------------------------------------------------------------
+// Check if all active motors are stationary
+// -----------------------------------------------------------------------
+bool AreMotorsStationary() {
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        if (motors[i]->StatusReg().bit.StepsActive) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------
+// Manual sync: step through each active motor individually
+// -----------------------------------------------------------------------
 void ManualSyncZero() {
     SerialPort.SendLine("\n--- SEQUENTIAL MANUAL SYNC START ---");
 
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        // 1. Prompt User for the specific motor
-        SerialPort.Send("ACTION REQUIRED: Prepare Motor ");
+        SerialPort.Send("ACTION REQUIRED: Prepare Motor M");
         SerialPort.Send(i);
-        // Set the homing position to 0 in MSP
         SerialPort.SendLine(" (Lock rotor and click Ctrl+0 in MSP).");
         SerialPort.SendLine("Press 'Y' when this motor is ready to sync...");
 
-        // 2. Wait for user confirmation ('Y') for this specific motor
         char response = 0;
         while (response != 'Y' && response != 'y') {
             if (SerialPort.AvailableForRead() > 0) {
-                response = SerialPort.CharGet(); // Capture individual response 
+                response = SerialPort.CharGet();
             }
         }
 
-        // 3. Enable the motor and wait for HLFB (All Systems Go / In-Range)
-        // Enabling energizes the coils to hold the physical position 
         motors[i]->EnableRequest(true);
-        
-        // 4: Wait for motor to finish enabling sequence
+
         while (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
-            // Safety: Abort if an alert (like a tracking error) occurs 
             if (motors[i]->StatusReg().bit.AlertsPresent) {
-                SerialPort.Send("Alert on Motor "); 
+                SerialPort.Send("Alert on Motor M");
                 SerialPort.Send(i);
                 SerialPort.SendLine("! Homing aborted.");
                 return;
@@ -81,15 +150,11 @@ void ManualSyncZero() {
             Delay_ms(1);
         }
 
-        // 5. Set the Logical Zero in ClearCore code
-        // This ensures the current shaft orientation is treated as "0" for absolute moves
         motors[i]->PositionRefSet(0);
         Delay_ms(10);
-
-        // 6: Disble the motor
         motors[i]->EnableRequest(false);
 
-        SerialPort.Send("Motor ");
+        SerialPort.Send("Motor M");
         SerialPort.Send(i);
         SerialPort.SendLine(" SUCCESS: Enabled and Zeroed.\n");
     }
@@ -98,32 +163,29 @@ void ManualSyncZero() {
     SerialPort.SendLine("CRITICAL: Remove all locking rods before commanding 'R' (Run).");
 }
 
-// function to set phase/angle differences
-void SetPhaseAngles(const int32_t angles[]){
-    // Safety Check: Ensure no moves are in progress before starting phase alignment
+// -----------------------------------------------------------------------
+// Set phase/angle offsets for all active motors
+// -----------------------------------------------------------------------
+void SetPhaseAngles(const int32_t angles[]) {
     if (!AreMotorsStationary()) {
         SerialPort.SendLine("ERROR: Cannot set phase while motors are running! Command 'S' first.");
-        return; 
+        return;
     }
     SerialPort.SendLine("Applying phase offsets...");
-    for (int i = 0; i < MOTOR_COUNT; i++){
-        // Convert degrees to counts 
+    for (int i = 0; i < MOTOR_COUNT; i++) {
         int32_t distance = (angles[i] * encoderResolution) / 360;
-        // Move(): move to the absolute position (0 ~ 8000)
         motors[i]->Move(distance, StepGenerator::MOVE_TARGET_ABSOLUTE);
-
     }
     Delay_ms(1);
-    // Wait for all to finish
-    for (int i = 0; i <MOTOR_COUNT; i++){
-        while(!motors[i]->StepsComplete()){
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        while (!motors[i]->StepsComplete()) {
             Delay_ms(1);
         }
-        //motors[i]->PositionRefSet(0); // Make the offset the new "Logical 0"
         Delay_ms(10);
     }
-    SerialPort.SendLine("Phase lock established");
+    SerialPort.SendLine("Phase lock established.");
 }
+
 
 // function: Start rotation at RPM
 void StartRotation(int32_t rpm){
@@ -346,39 +408,36 @@ bool allMotorsInRange(){
     return true; // All motors are physically at 2000 RPM (within tolerance)
 }
 
+// -----------------------------------------------------------------------
+// setup()
+// -----------------------------------------------------------------------
 void setup() {
-    // Set the input clocking rate for the MotorDriver connectors as a group, they cannot be individually set. 
-    MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
-
-    // Put all motors into Step and Direction mode. They cannot be individually set. 
-    MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
-
-    // Convert acceleration limit (RPM/s^2) to pulses / s^2
-    int32_t accelStepsPerSec_2 = (encoderResolution * accelerationLimit ) / 60;
-    int32_t velmaxStepsPerSec_2 = (encoderResolution * velocityMAX) / 60;
-
-    for (int i = 0; i < MOTOR_COUNT; i++){
-        motors[i]->AccelMax(accelStepsPerSec_2);
-        motors[i]->VelMax(velmaxStepsPerSec_2);
-
-        // HLFB_Mode_Static is required for In-Range, ASG, and Servo On Modes
-        motors[i]->HlfbMode(MotorDriver::HLFB_MODE_STATIC);
-    }
+    // Set USB serial
+    SerialPort.Mode(Connector::USB_CDC);
+    SerialPort.Speed(baudRate);
+    SerialPort.PortOpen();
 
     uint32_t start = Milliseconds();
-
-    // Set the mode to USB Serial
-    SerialPort.Mode(Connector::USB_CDC);
-    // Set the communication speed (Baud Rate)
-    SerialPort.Speed(baudRate); // 9600 or 115200 / 
-    SerialPort.PortOpen();
-    while(!SerialPort){
-        if (Milliseconds() - start > 5000){
-            SerialPort.SendLine("Communication between the motors and controller was not established within 5 seconds");
-            break;
-        };
+    while (!SerialPort) {
+        if (Milliseconds() - start > 5000) {
+            break; // Continue even if no terminal is connected
+        }
     }
-    SerialPort.SendLine("Commands: 'M'= Manual Homing, 'D'= Disable All the motors, 'E'= Enable All the motors, 'P'= Set Phase Angles, 'R'= Start Rotation, 'S'= Stop Rotation, 'G'= Move motors to targets");
+    Delay_ms(200); // Short settle time for the terminal to connect
+
+    // Step 1: Ask how many motors
+    PromptMotorCount();
+
+    // Step 2: Apply global mode settings (must be done before per-motor config)
+    MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
+    MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
+
+    // Step 3: Configure only the active motors
+    SerialPort.SendLine("Configuring active motors...");
+    ConfigureMotors();
+
+    SerialPort.SendLine("\nCommands: 'M'=Manual Homing, 'D'=Disable, 'E'=Enable, 'P'=Set Phase, 'R'=Start Rotation, 'S'=Stop, 'G'=Move to Targets");
+    SerialPort.SendLine("----------------------------------------------");
 }
 
 void loop() {
@@ -426,4 +485,3 @@ void loop() {
         }
     }
 }
-
