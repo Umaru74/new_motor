@@ -12,8 +12,8 @@
 #define motor3 ConnectorM2
 #define motor4 ConnectorM3
 
-int MOTOR_COUNT = 0; // Run-time motor count 
-
+// Run-time motor count
+int MOTOR_COUNT = 0;
 
 #define SerialPort ConnectorUsb
 
@@ -21,30 +21,25 @@ int MOTOR_COUNT = 0; // Run-time motor count
 MotorDriver *motorPool[] = {&motor1, &motor2, &motor3, &motor4};
 
 // --- Active motors array (pointer into motorPool, sized at runtime) ---
-// We declare the max size statically; only [0..MOTOR_COUNT-1] are used.
 MotorDriver *motors[4] = {nullptr, nullptr, nullptr, nullptr};
 
 // Hardware Constants
-const int32_t encoderResolution = 8000; // Counts per revolution (set to match MSP) , 8000 RPM CAP for step/dir mode
+const int32_t encoderResolution = 8000; // Counts per revolution (set to match MSP) , 8000 resolution CAP for step/dir mode
 const int32_t velocityRPM = 1000; // Target RPM 
 const int32_t velocityMAX = 1000; // max RPM
-const uint32_t accelerationLimit = 300; // RPM / sec^2
-const uint32_t decelerationLimit = 300; // RPM / sec^2
-const int32_t homingVelocity = 300; // move negative toward hard stop
-const int32_t exitHomingMove = 200; // Distance to move away to exit homing mode
+const uint32_t accelerationLimit = 200; // RPM / sec^2
+const uint32_t decelerationLimit = 200; // RPM / sec^2
 const int32_t baudRate = 115200; // Communication speed for USB, baudRate needs to match with the host computer, monitor
 
-bool isRotating = false; // Global flag to see if motors are at the desired speed (not ramping)
-
 // Define phase offsets in degree, corresponding to motor 0, 1 (+ve goes CCW , -ve goes CW)
-const int32_t offsets[] = {0, 90, 180, 270};
+const float offsets[] = {0, 90, 180, 270};
 
 // Define specific motor location to move to (such as when to close the valve for emergency)
-const int32_t targets[] = {0, 0, 0, 0}; // in degree with respect to the motor 0, initial location
+const float homes[] = {0, 0, 0, 0}; // in degree with respect to the motor 0, initial location
 
 
 // -----------------------------------------------------------------------
-// Startup: Ask the user how many motors to activate (1-4)
+// Startup: Ask the user how many motors to activate (1-4), used in setup()
 // -----------------------------------------------------------------------
 void PromptMotorCount() {
     SerialPort.SendLine("==============================================");
@@ -69,12 +64,10 @@ void PromptMotorCount() {
         }
         Delay_ms(10);
     }
-
     // Populate the active motors[] array from the pool
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motors[i] = motorPool[i];
     }
-
     SerialPort.Send("Motor count set to: ");
     SerialPort.SendLine(MOTOR_COUNT);
     SerialPort.Send("Active connectors: M0");
@@ -86,7 +79,7 @@ void PromptMotorCount() {
 }
 
 // -----------------------------------------------------------------------
-// Configure acceleration, velocity limits for each active motor
+// Configure acceleration, velocity limits for each active motor, HLFB mode
 // -----------------------------------------------------------------------
 void ConfigureMotors() {
     int32_t accelStepsPerSec_2  = (encoderResolution * accelerationLimit) / 60;
@@ -110,13 +103,16 @@ void ConfigureMotors() {
 // -----------------------------------------------------------------------
 // Check if all active motors are stationary
 // -----------------------------------------------------------------------
-bool AreMotorsStationary() {
+bool AllMotorsStationary() {
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        if (motors[i]->StatusReg().bit.StepsActive) {
-            return false;
+        // StepsComplete() = ClearCore has finished sending pulses
+        // HLFB_ASSERTED   = motor has physically settled in position
+        if (!motors[i]->StepsComplete() || 
+            motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
+            return false; // motors are moving
         }
     }
-    return true;
+    return true; // motors are stationary
 }
 
 // -----------------------------------------------------------------------
@@ -138,13 +134,14 @@ void ManualSyncZero() {
             }
         }
 
-        motors[i]->EnableRequest(true);
+        motors[i]->EnableRequest(true); // moves to the original home position set on MSP ?
 
         while (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
             if (motors[i]->StatusReg().bit.AlertsPresent) {
                 SerialPort.Send("Alert on Motor M");
                 SerialPort.Send(i);
                 SerialPort.SendLine("! Homing aborted.");
+                PrintAlerts();
                 return;
             }
             Delay_ms(1);
@@ -164,28 +161,32 @@ void ManualSyncZero() {
 }
 
 // -----------------------------------------------------------------------
-// Set phase/angle offsets for all active motors
+// Set phase/angle offsets for all active motors, positionRefSet(0) 
 // -----------------------------------------------------------------------
-void SetPhaseAngles(const int32_t angles[]) {
-    if (!AreMotorsStationary()) {
+void SetPhaseAngles(const float angles[]) {
+    if (!AllMotorsStationary()) {
         SerialPort.SendLine("ERROR: Cannot set phase while motors are running! Command 'S' first.");
         return;
     }
     SerialPort.SendLine("Applying phase offsets...");
+
+    // Command all motors simultaneously
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        int32_t distance = (angles[i] * encoderResolution) / 360;
+        // Use float math before casting to int32_t at the end
+        int32_t distance = (int32_t)((angles[i] * encoderResolution) / 360.0f);
+
+        SerialPort.Send("Motor ");
+        SerialPort.Send(i);
+        SerialPort.Send(" target steps: ");
+        SerialPort.SendLine(distance);
+
         motors[i]->Move(distance, StepGenerator::MOVE_TARGET_ABSOLUTE);
     }
-    Delay_ms(1);
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        while (!motors[i]->StepsComplete()) {
-            Delay_ms(1);
-        }
-        Delay_ms(10);
+    while (!AllMotorsStationary()){
+        Delay_ms(1);
     }
     SerialPort.SendLine("Phase lock established.");
 }
-
 
 // function: Start rotation at RPM
 void StartRotation(int32_t rpm){
@@ -233,7 +234,6 @@ void StartRotation(int32_t rpm){
 
         Delay_ms(1); // reduce CPU usage
     }
-    isRotating = true;
     SerialPort.Send("All motors have hit the desired RPM:");
     SerialPort.SendLine(rpm);
 }
@@ -269,121 +269,116 @@ void StopAll() {
         }
         Delay_ms(1);
     }
-    isRotating = false;
     SerialPort.SendLine("All motors have come to a stop.");
 }
 
-// Function: Smoothly decelerate from 2000 RPM to a specific absolute count
-void MoveMotorsToTargets(const int32_t targets[]) {
-    if(!isRotating){
-        SerialPort.SendLine("Moving motors to individual absolute targets...");
+// Function: Move the motors to the homing position set by PositionRefSet(0)
+void HomingMotors(const float targets[]) {
+    if(!AllMotorsStationary()){
+        SerialPort.SendLine("Stop Motors before moving to targets");
+        return;
+    }
 
-        for (int i = 0; i < MOTOR_COUNT; i++) {
-            // Always check for alerts before commanding a move 
-            if (motors[i]->StatusReg().bit.AlertsPresent) {
+
+    SerialPort.SendLine("Moving motors to home position");
+    // Command all motors simultaneously
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        // Always check for alerts before commanding a move 
+        if (motors[i]->StatusReg().bit.AlertsPresent) {
                 SerialPort.Send("Motor "); 
                 SerialPort.Send(i); 
                 SerialPort.SendLine(" in alert. Skipping.");
                 continue;
-            }
-            int32_t target_angle = (targets[i] * encoderResolution) / 360;
-            // Use MOVE_TARGET_ABSOLUTE to move to the exact count relative to zero
-            motors[i]->Move(target_angle, StepGenerator::MOVE_TARGET_ABSOLUTE);     // Need to convert targets degree to counts 
         }
+        int32_t target_steps = (int32_t)((targets[i] * encoderResolution) / 360.0f);
+        // Use MOVE_TARGET_ABSOLUTE to move to homing position
+        motors[i]->Move(target_steps, StepGenerator::MOVE_TARGET_ABSOLUTE);     // Need to convert targets degree to counts 
+    }
 
-        uint32_t startTime = Milliseconds();
-
-        // Wait for all motors to physically arrive at their targets
-        for (int i = 0; i < MOTOR_COUNT; i++) {
-            while (!motors[i]->StepsComplete()) {
-                if (Milliseconds() - startTime > 15000){
-                    SerialPort.SendLine("Error: Motor move timed out");
-                    break;
-                }
-                Delay_ms(1);
-            }
+    // Single shared timeout — no for loop needed
+    uint32_t startTime = Milliseconds();
+    while (!AllMotorsStationary()) {
+        if (Milliseconds() - startTime > 15000) {
+            SerialPort.SendLine("ERROR: Homing timed out.");
+            return;
         }
-
-        SerialPort.SendLine("All motors arrived at target counts.");
+        Delay_ms(1);
     }
-    if(isRotating){
-        SerialPort.SendLine("Stop Motors before moving to targets");
-        return;
-    }
+    SerialPort.SendLine("Homing complete.");
 }
 
-void EnableAllMotors(){
+
+//-------------------------------
+// EnableAllMotors(): function to enable all the motors, timeout after 10seconds
+//-------------------------------
+void EnableAllMotors() {
     SerialPort.SendLine("Enabling all motors...");
-    // "EnableRequest": Request all motors to enable
-    for (int i = 0; i < MOTOR_COUNT; i++){
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
         motors[i]->EnableRequest(true);
     }
 
+    SerialPort.SendLine("Waiting for HLFB...");
+
     uint32_t startTime = Milliseconds();
+    uint32_t lastStatusTime = Milliseconds();
 
-    // Wait for all motors to physically energize and clear alerts
-    bool allReady = false;
-    // Wait for all motors to finish enabling
-    // while (!allReady) {
-    //     allReady = true; 
-    //     for (int i = 0; i < MOTOR_COUNT; i++) {
-    //         // If HLFB is still de-asserted, we are NOT ready yet
-    //         if (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
-    //             allReady = false;
-    //         }
+    // Wait for ALL motors in parallel
+    while (!AllMotorsStationary()) {
+        // Print status every 1000ms
+        if (Milliseconds() - lastStatusTime > 1000) {
+            SerialPort.SendLine("Still waiting for HLFB...");
+            lastStatusTime = Milliseconds(); // Reset status timer
+        }
 
-    //         // CRITICAL: Only return an error if an alert is ACTUALLY present
-    //         if (motors[i]->StatusReg().bit.AlertsPresent) {
-    //             SerialPort.Send("Motor Fault Detected: ");
-    //             SerialPort.SendLine(i);
-    //             return; // Hardware failure (e.g., no DC power or tracking error)
-    //         }
-    //     }
-
-    //     if (Milliseconds() - startTime > 15000) {
-    //         SerialPort.SendLine("Timeout enabling motors!");
-    //         return;
-    //     }
-    //     Delay_ms(1);
-    // }
-
-    // "ValidateMove": verify that the motor is in a good state before sending a move command 
-    for (int i =0; i < MOTOR_COUNT; i++){
-        if (!motors[i]->ValidateMove(false)){
-            SerialPort.SendLine("Error: A motor failed validation after enabling");
+        // Timeout after 10 seconds
+        if (Milliseconds() - startTime > 10000) {
+            SerialPort.SendLine("ERROR: Timeout waiting for motors to enable.");
             return;
         }
+
+        // Check for alerts on any motor
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            if (motors[i]->StatusReg().bit.AlertsPresent) {
+                SerialPort.Send("ERROR: Alert on motor ");
+                SerialPort.SendLine(i);
+                return;
+            }
+        }
+
+        Delay_ms(1);
     }
 
-    SerialPort.SendLine("All motors are enabled, and ready to go");
+    SerialPort.SendLine("All motors enabled and ready.");
 }
 
 void DisableAllMotors() {
     SerialPort.SendLine("Disabling all motors...");
 
-    // Check if all motors are stationary
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        // StepsComplete() returns true if the trajectory generator is idle 
-        // VelocityRefCommanded() == 0 ensures the target speed is zero
         if (!motors[i]->StepsComplete() || motors[i]->VelocityRefCommanded() != 0) {
             SerialPort.SendLine("ERROR: Motion detected! Cannot disable motors while moving.");
-            SerialPort.SendLine("Stop the moving motors first before disabling...");
-            return; // Exit the function immediately
+            SerialPort.SendLine("Stop the moving motors first before disabling.");
+            return;
         }
-    } 
+    }
 
-    // Send the disable request to all motors
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        // Passing false de-asserts the Enable signal and removes coil power 
         motors[i]->EnableRequest(false);
     }
 
-    // Wait for the hardware to confirm the motors are disabled
+    // Wait for hardware confirmation with timeout
+    uint32_t startTime = Milliseconds();
     bool allDisabled = false;
+
     while (!allDisabled) {
-        allDisabled = true; 
+        if (Milliseconds() - startTime > 2000) {
+            SerialPort.SendLine("ERROR: Timeout waiting for motors to disable.");
+            return;
+        }
+
+        allDisabled = true;
         for (int i = 0; i < MOTOR_COUNT; i++) {
-            // Check if internal hardware state is MOTOR_DISABLED 
             if (motors[i]->StatusReg().bit.ReadyState != MotorDriver::MOTOR_DISABLED) {
                 allDisabled = false;
             }
@@ -391,11 +386,87 @@ void DisableAllMotors() {
         Delay_ms(1);
     }
 
-    SerialPort.SendLine("All motors are disabled and de-energized.");
+    SerialPort.SendLine("All motors disabled and de-energized.");
 }
 
+// -----------------------------------------------------------------------
+// HandleAlerts(): Clear motor faults by cycling enable and clearing registers
+// -----------------------------------------------------------------------
+void HandleAlerts() {
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        if (motors[i]->AlertReg().bit.MotorFaulted) {
+            SerialPort.Send("Fault detected on motor ");
+            SerialPort.SendLine(i);
+
+            // Cycle enable to clear physical fault
+            motors[i]->EnableRequest(false);
+            Delay_ms(100);  // Give motor time to fully de-energize
+            motors[i]->EnableRequest(true);
+
+            // Wait for motor to recover before clearing alerts
+            uint32_t startTime = Milliseconds();
+            while (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
+                if (Milliseconds() - startTime > 5000) {
+                    SerialPort.Send("ERROR: Motor ");
+                    SerialPort.Send(i);
+                    SerialPort.SendLine(" did not recover after fault clear.");
+                    return;
+                }
+                Delay_ms(1);
+            }
+
+            // Now safe to clear alerts
+            motors[i]->ClearAlerts();
+
+            // Verify alerts actually cleared
+            if (motors[i]->StatusReg().bit.AlertsPresent) {
+                SerialPort.Send("WARNING: Motor ");
+                SerialPort.Send(i);
+                SerialPort.SendLine(" still has alerts after clear attempt.");
+            } else {
+                SerialPort.Send("Motor ");
+                SerialPort.Send(i);
+                SerialPort.SendLine(" fault cleared successfully.");
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// PrintAlerts(): Prints all active alerts for diagnostic purposes
+// -----------------------------------------------------------------------
+void PrintAlerts() {
+    bool anyAlerts = false;
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        if (motors[i]->StatusReg().bit.AlertsPresent) {
+            anyAlerts = true;
+            SerialPort.Send("Alerts on Motor ");
+            SerialPort.SendLine(i);
+
+            if (motors[i]->AlertReg().bit.MotionCanceledInAlert) 
+                SerialPort.SendLine("  - MotionCanceledInAlert");
+            if (motors[i]->AlertReg().bit.MotionCanceledPositiveLimit) 
+                SerialPort.SendLine("  - MotionCanceledPositiveLimit");
+            if (motors[i]->AlertReg().bit.MotionCanceledNegativeLimit) 
+                SerialPort.SendLine("  - MotionCanceledNegativeLimit");
+            if (motors[i]->AlertReg().bit.MotionCanceledSensorEStop) 
+                SerialPort.SendLine("  - MotionCanceledSensorEStop");
+            if (motors[i]->AlertReg().bit.MotionCanceledMotorDisabled) 
+                SerialPort.SendLine("  - MotionCanceledMotorDisabled");
+            if (motors[i]->AlertReg().bit.MotorFaulted) 
+                SerialPort.SendLine("  - MotorFaulted (Shutdown)");
+        }
+    }
+
+    if (!anyAlerts) {
+        SerialPort.SendLine("No alerts present on any motor.");
+    }
+}
+
+
 // HLFB mode needs to be set for "In Range-Velocity" on MSP for each motor 
-bool allMotorsInRange(){
+bool AllMotorsInRange(){
     for (int i = 0; i < MOTOR_COUNT; i++){
         // HlfbState() returns HLFB_ASSERTED when the motor is physically
         // within the MSP-defined speed window 
@@ -409,7 +480,7 @@ bool allMotorsInRange(){
 }
 
 // -----------------------------------------------------------------------
-// setup()
+// setup(): Runs when the controller is powered up
 // -----------------------------------------------------------------------
 void setup() {
     // Set USB serial
@@ -418,8 +489,9 @@ void setup() {
     SerialPort.PortOpen();
 
     uint32_t start = Milliseconds();
+    uint32_t timeout = 5000;
     while (!SerialPort) {
-        if (Milliseconds() - start > 5000) {
+        if (Milliseconds() - start > timeout) {
             break; // Continue even if no terminal is connected
         }
     }
@@ -436,7 +508,7 @@ void setup() {
     SerialPort.SendLine("Configuring active motors...");
     ConfigureMotors();
 
-    SerialPort.SendLine("\nCommands: 'M'=Manual Homing, 'D'=Disable, 'E'=Enable, 'P'=Set Phase, 'R'=Start Rotation, 'S'=Stop, 'G'=Move to Targets");
+    SerialPort.SendLine("Commands: 'M'=Manual Homing, 'D'=Disable, 'E'=Enable, 'P'=Set Phase, 'R'=Start Rotation, 'S'=Stop, 'G'=Move to Targets, 'A'=Print Alerts, 'H'=Handle Alerts");
     SerialPort.SendLine("----------------------------------------------");
 }
 
@@ -471,17 +543,25 @@ void loop() {
                 break;
             case 'G': case 'g': 
                 SerialPort.SendLine("----Move Motors To Targets Command Initialized----");
-                MoveMotorsToTargets(targets); 
+                HomingMotors(homes); 
                 break;
-        }
+            case 'A': case 'a':
+                SerialPort.SendLine("----Print Alerts Command Initialized----");
+                PrintAlerts();
+                break;
+            case 'H': case 'h':
+                SerialPort.SendLine("----Handle Alerts Command Initialized----");
+                HandleAlerts();
+                break;    
+            }
     }
 
     // 2: Continuous Monitoring (Only when motors are at the desired speed)
-    if (isRotating){
-        if (!allMotorsInRange()){
+    if (!AllMotorsStationary()){
+        if (!AllMotorsInRange()){
             SerialPort.SendLine("CRITICAL: Synchronization lost or motor stalled!");
+            PrintAlerts();
             StopAll(); // safety action, stop the motors when they are not synchronizing 
-            isRotating = false;
         }
     }
 }
