@@ -25,10 +25,10 @@ MotorDriver *motors[4] = {nullptr, nullptr, nullptr, nullptr};
 
 // Hardware Constants
 const int32_t encoderResolution = 8000; // Counts per revolution (set to match MSP) , 8000 resolution CAP for step/dir mode
-const int32_t velocityRPM = 2000; // Target RPM 
-const int32_t velocityMAX = 2000; // max RPM
-const uint32_t accelerationLimit = 200; // RPM / sec^2
-const uint32_t decelerationLimit = 200; // RPM / sec^2
+const int32_t velocityRPM = 100; // Target RPM 
+const int32_t velocityMAX = 100; // max RPM
+const uint32_t accelerationLimit = 50; // RPM / sec^2
+const uint32_t decelerationLimit = 50; // RPM / sec^2
 const int32_t baudRate = 115200; // Communication speed for USB, baudRate needs to match with the host computer, monitor
 bool motorsRunning = false;
 
@@ -265,7 +265,7 @@ void StartRotation(int32_t rpm){
         }
 
         // Time Out Protection: 15s
-        if (Milliseconds() - startTime > 15000) {
+        if (Milliseconds() - startTime > 30000) {
             SerialPort.SendLine("Error: Motors failed to reach target speed!");
             StopAll();
             return;
