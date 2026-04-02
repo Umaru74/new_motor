@@ -1,6 +1,3 @@
-// "MotorManager" class handles the configuration of physical motor connectors (M-0 through M-3)
-// These motor connectors are represented and controlled by instances of the "MotorDriver" class
-
 // "Step & Direction" mode needs to be set on MSP software
 // HLFB_MODE_STATIC required when MSP HLFB is configured for
 //"In Range - Position" or "In Range - Velocity"
@@ -23,37 +20,54 @@ MotorDriver *motorPool[] = {&motor1, &motor2, &motor3, &motor4};
 // --- Active motors array (pointer into motorPool, sized at runtime) ---
 MotorDriver *motors[4] = {nullptr, nullptr, nullptr, nullptr};
 
+// -----------------------------------------------------------------------
 // Hardware Constants
-const int32_t encoderResolution = 8000; // Counts per revolution (set to match MSP) , 8000 resolution CAP for step/dir mode
-const int32_t velocityRPM = 100; // Target RPM 
-const int32_t velocityMAX = 100; // max RPM
-const uint32_t accelerationLimit = 50; // RPM / sec^2
-const uint32_t decelerationLimit = 50; // RPM / sec^2
-const int32_t baudRate = 115200; // Communication speed for USB, baudRate needs to match with the host computer, monitor
+// -----------------------------------------------------------------------
+const int32_t encoderResolution = 8000; // maximum encoder resolution for step & direction mode 
+const int32_t baudRate          = 115200; // needs to match with host computer USB baudRate
+
+// -----------------------------------------------------------------------
+// Default motor configuration. phase are sets for shock-wave 
+// -----------------------------------------------------------------------
+#define DEFAULT_RPM     2000 // in RPM / sec (CCW unless reversed on MSP software)
+#define DEFAULT_ACCEL   200 // in RPM / sec^2
+#define DEFAULT_DECEL   200 // in RPM / sec^2
+#define DEFAULT_PHASE_0 147.6f // in degrees, 3280 counts 
+#define DEFAULT_PHASE_1 75.6f // in degrees, 1680 counts 
+#define DEFAULT_PHASE_2 140.4f // in degrees, 3120 counts 
+#define DEFAULT_PHASE_3 0.0f // in degrees, 0 counts 
+
+// -----------------------------------------------------------------------
+// Runtime configuration — changeable via serial
+// -----------------------------------------------------------------------
+int32_t  velocityRPM       = DEFAULT_RPM;
+int32_t  velocityMAX       = DEFAULT_RPM;
+uint32_t accelerationLimit = DEFAULT_ACCEL;
+uint32_t decelerationLimit = DEFAULT_DECEL;
+float    offsets[4]        = {DEFAULT_PHASE_0, DEFAULT_PHASE_1, DEFAULT_PHASE_2, DEFAULT_PHASE_3};
+
+// Serial buffer for multi-char commands
+String serialBuffer = "";
+
+// Motor state
 bool motorsRunning = false;
-
-// Define phase offsets in degree, corresponding to motor 0, 1 (+ve goes CCW , -ve goes CW)
-const float offsets[] = {0, 90, 180, 270};
-
-// Define specific motor location to move to (such as when to close the valve for emergency)
-// const float homes[] = {0, 0, 0, 0}; // in degree with respect to the motor 0, initial location
 
 // Forward declarations
 void PrintAlerts();
 void DisableAllMotors();
 void EnableAllMotors();
 void StopAll();
+void PrintStatus();
 
 // Define system states
 enum SystemState {
-    STATE_IDLE,        // Motors enabled, not yet synced
-    STATE_SYNCED,      // Manual sync done, ready for phase
+    STATE_DISABLED,    // Motors disabled
+    STATE_IDLE,        // Motors enabled, homed, synced at home 
     STATE_PHASE_SET,   // Phase angles applied, ready to run
     STATE_RUNNING,     // Motors spinning
-    STATE_HOMED        // Motors homed, back to idle
 };
 
-SystemState systemState = STATE_IDLE;
+SystemState systemState = STATE_DISABLED;
 
 // -----------------------------------------------------------------------
 // Startup: Ask the user how many motors to activate (1-4), used in setup()
@@ -136,58 +150,26 @@ bool AllMotorsStationary() {
 // -----------------------------------------------------------------------
 // Manual sync: step through each active motor individually
 // -----------------------------------------------------------------------
-void ManualSyncZero() {
-    if (systemState != STATE_IDLE && systemState != STATE_HOMED){
-        SerialPort.SendLine("ERROR: Must be in IDLE or HOMED state to sync");
-        return;
-    }
-    SerialPort.SendLine("\n--- SEQUENTIAL MANUAL SYNC START ---");
+void AutoSyncZero() {
+    SerialPort.SendLine("\n--- SEQUENTIAL AUTO SYNC START ---");
 
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        SerialPort.Send("ACTION REQUIRED: Prepare Motor M");
-        SerialPort.Send(i);
-        SerialPort.SendLine(" (Lock rotor and click Ctrl+0 in MSP).");
-        SerialPort.SendLine("Press 'Y' when this motor is ready to sync...");
-
-        char response = 0;
-        while (response != 'Y' && response != 'y') {
-            if (SerialPort.AvailableForRead() > 0) {
-                response = SerialPort.CharGet();
-            }
-        }
-
-        motors[i]->EnableRequest(true); // moves to the original home position set on MSP ?
-
-        while (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
-            if (motors[i]->StatusReg().bit.AlertsPresent) {
-                SerialPort.Send("Alert on Motor M");
-                SerialPort.Send(i);
-                SerialPort.SendLine("! Homing aborted.");
-                PrintAlerts();
-                return;
-            }
-            Delay_ms(1);
-        }
-
         motors[i]->PositionRefSet(0);
         Delay_ms(10);
-        //motors[i]->EnableRequest(false);
 
         SerialPort.Send("Motor M");
         SerialPort.Send(i);
-        SerialPort.SendLine(" SUCCESS: Enabled and Zeroed.\n");
+        SerialPort.SendLine(" SUCCESS: SYNCED.\n");
     }
-    systemState = STATE_SYNCED;
     SerialPort.SendLine("--- ALL MOTORS SYNCED ---");
-    SerialPort.SendLine("CRITICAL: Remove all locking rods before commanding 'R' (Run).");
 }
 
 // -----------------------------------------------------------------------
 // Set phase/angle offsets for all active motors, positionRefSet(0) 
 // -----------------------------------------------------------------------
 void SetPhaseAngles(const float angles[]) {
-    if (systemState != STATE_SYNCED) {
-        SerialPort.SendLine("ERROR: Must run Manual Sync 'M' before setting phase.");
+    if (systemState != STATE_IDLE) {
+        SerialPort.SendLine("ERROR: Motors must be in idle state.");
         return;
     }
 
@@ -221,8 +203,8 @@ void SetPhaseAngles(const float angles[]) {
 
 // function: Start rotation at RPM
 void StartRotation(int32_t rpm){
-    if (systemState != STATE_PHASE_SET && systemState != STATE_SYNCED) {
-        SerialPort.SendLine("ERROR: Must sync 'M' before running.");
+    if (systemState != STATE_PHASE_SET && systemState != STATE_IDLE) {
+        SerialPort.SendLine("ERROR: Must be in idle state or phase set state");
         return;
     }
     // Convert RPM to steps/sec: (RPM/60)*8000
@@ -277,7 +259,7 @@ void StartRotation(int32_t rpm){
     SerialPort.SendLine(rpm);
 }
 
-// function: Stop all motors smoothly
+// function: Stop all the motors slowly, and move motors back to homing position 
 void StopAll() {
     if (systemState != STATE_RUNNING) {
         SerialPort.SendLine("ERROR: Motors are not running.");
@@ -292,6 +274,8 @@ void StopAll() {
         // "MoveStopDecel": Interrupts any current move and commands the motor to stop. 
         motors[i]->MoveStopDecel(decelStepsPerSec_2);
     }
+
+    Delay_ms(200);
 
     // Wait for all motors to ramp down and reach zero velocity
     bool allStopped = false;
@@ -315,6 +299,7 @@ void StopAll() {
         }
         Delay_ms(1);
     }
+    HomeAllMotors();
     systemState = STATE_IDLE;
     motorsRunning = false;
     SerialPort.SendLine("All motors have come to a stop.");
@@ -322,24 +307,28 @@ void StopAll() {
 
 // Function: Move the motors to the homing position set by PositionRefSet(0)
 void HomeAllMotors() {
-    if (systemState != STATE_IDLE) {
-        SerialPort.SendLine("ERROR: Stop motors before homing.");
+    if (systemState == STATE_RUNNING){
+        SerialPort.SendLine("ERROR: Stop motors before homing");
         return;
     }
-    SerialPort.SendLine("Homing all motors via MSP...");
 
+    if (systemState == STATE_DISABLED){
+        SerialPort.SendLine("ERROR: Enable motors first before homing");
+        return;
+    }
+
+    SerialPort.SendLine("Homing all motors...");
     // Disable first to trigger MSP homing on re-enable
     DisableAllMotors();
     Delay_ms(500); // Let motors fully de-energize
 
-    // Re-enable triggers MSP homing routine (CW to home)
+    // Re-enable triggers MSP homing routine (CCW to home)
     EnableAllMotors();
 
     // Now software zero matches physical home
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motors[i]->PositionRefSet(0);
     }
-    systemState = STATE_HOMED;
     SerialPort.SendLine("All motors homed and zeroed.");
 }
 
@@ -384,8 +373,9 @@ void EnableAllMotors() {
 
         Delay_ms(1);
     }
-
-    SerialPort.SendLine("All motors enabled and ready.");
+    AutoSyncZero();
+    systemState = STATE_IDLE;
+    SerialPort.SendLine("All motors enabled, synchronized and ready.");
 }
 
 void DisableAllMotors() {
@@ -421,7 +411,7 @@ void DisableAllMotors() {
         }
         Delay_ms(1);
     }
-
+    systemState = STATE_DISABLED;
     SerialPort.SendLine("All motors disabled and de-energized.");
 }
 
@@ -466,6 +456,29 @@ void HandleAlerts() {
             }
         }
     }
+}
+
+// -----------------------------------------------------------------------
+// PrintStatus(): Print all current runtime config
+// -----------------------------------------------------------------------
+void PrintStatus() {
+    SerialPort.Send("State: ");
+    switch (systemState) {
+        case STATE_DISABLED:  SerialPort.SendLine("Disabled");  break;
+        case STATE_IDLE:      SerialPort.SendLine("IDLE");      break;
+        case STATE_PHASE_SET: SerialPort.SendLine("PHASE_SET"); break;
+        case STATE_RUNNING:   SerialPort.SendLine("RUNNING");   break;
+    }
+    SerialPort.Send("  Motors: ");        SerialPort.SendLine(MOTOR_COUNT);
+    SerialPort.Send("  RPM:    ");        SerialPort.SendLine(velocityRPM);
+    SerialPort.Send("  Accel:  ");        SerialPort.SendLine(accelerationLimit);
+    SerialPort.Send("  Decel:  ");        SerialPort.SendLine(decelerationLimit);
+    SerialPort.Send("  Phases: ");
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        SerialPort.Send(offsets[i]);
+        if (i < MOTOR_COUNT - 1) SerialPort.Send(", ");
+    }
+    SerialPort.SendLine(" degrees");
 }
 
 // -----------------------------------------------------------------------
@@ -516,6 +529,134 @@ bool AllMotorsInRange(){
 }
 
 // -----------------------------------------------------------------------
+// processCommand(): Handle single-char and multi-char serial commands
+// -----------------------------------------------------------------------
+void processCommand(String cmd) {
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    // ── Single character commands ──
+    if (cmd.length() == 1) {
+        char c = toupper(cmd.charAt(0));
+        switch (c) {
+            case 'E': SerialPort.SendLine("----Enable All Motors----");    EnableAllMotors();          break;
+            case 'D': SerialPort.SendLine("----Disable All Motors----");   DisableAllMotors();         break;
+            case 'G': SerialPort.SendLine("----Home All Motors----");      HomeAllMotors();            break;
+            case 'P': SerialPort.SendLine("----Set Phase Angles----");     SetPhaseAngles(offsets);    break;
+            case 'R': SerialPort.SendLine("----Start Rotation----");       StartRotation(velocityRPM); break;
+            case 'S': SerialPort.SendLine("----Stop All Motors----");      StopAll();                  break;
+            case 'A': SerialPort.SendLine("----Print Alerts----");         PrintAlerts();              break;
+            case 'H': SerialPort.SendLine("----Handle Alerts----");        HandleAlerts();             break;
+            case '?': PrintStatus();                                                                   break;
+        }
+        return;
+    }
+
+    // ── RPM:2000 ──
+    if (cmd.startsWith("RPM:")) {
+        int32_t val = (int32_t)cmd.substring(4).toFloat();
+        if (val < 100 || val > 2250) {
+            SerialPort.SendLine("ERROR: RPM must be 100-2250.");
+            return;
+        }
+        velocityRPM = val;
+        velocityMAX = val;
+        int32_t sps = (encoderResolution * velocityRPM) / 60;
+        for (int i = 0; i < MOTOR_COUNT; i++) motors[i]->VelMax(sps);
+        SerialPort.Send("RPM set to: ");
+        SerialPort.SendLine(velocityRPM);
+        return;
+    }
+
+    // ── ACCEL:300 ──
+    if (cmd.startsWith("ACCEL:")) {
+        uint32_t val = (uint32_t)cmd.substring(6).toFloat();
+        if (val < 10 || val > 1000) {
+            SerialPort.SendLine("ERROR: Accel must be 10-1000.");
+            return;
+        }
+        accelerationLimit = val;
+        int32_t sps2 = (encoderResolution * accelerationLimit) / 60;
+        for (int i = 0; i < MOTOR_COUNT; i++) motors[i]->AccelMax(sps2);
+        SerialPort.Send("Accel set to: ");
+        SerialPort.SendLine(accelerationLimit);
+        return;
+    }
+
+    // ── DECEL:300 ──
+    if (cmd.startsWith("DECEL:")) {
+        uint32_t val = (uint32_t)cmd.substring(6).toFloat();
+        if (val < 10 || val > 1000) {
+            SerialPort.SendLine("ERROR: Decel must be 10-1000.");
+            return;
+        }
+        decelerationLimit = val;
+        SerialPort.Send("Decel set to: ");
+        SerialPort.SendLine(decelerationLimit);
+        return;
+    }
+
+    // ── PHASE:0,90.5,180,270 ──
+    if (cmd.startsWith("PHASE:")) {
+        String data = cmd.substring(6);
+        float vals[4] = {0, 0, 0, 0};
+        int idx = 0, start = 0;
+        for (int i = 0; i <= (int)data.length() && idx < 4; i++) {
+            if (i == (int)data.length() || data.charAt(i) == ',') {
+                vals[idx++] = data.substring(start, i).toFloat();
+                start = i + 1;
+            }
+        }
+        for (int i = 0; i < 4; i++) offsets[i] = vals[i];
+        SerialPort.Send("Phases set to: ");
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            SerialPort.Send(offsets[i]);
+            if (i < MOTOR_COUNT - 1) SerialPort.Send(", ");
+        }
+        SerialPort.SendLine(" degrees");
+        return;
+    }
+
+    // ── MOTORS:2 ──
+    if (cmd.startsWith("MOTORS:")) {
+        int val = cmd.substring(7).toInt();
+        if (val < 1 || val > 4) {
+            SerialPort.SendLine("ERROR: Motor count must be 1-4.");
+            return;
+        }
+        MOTOR_COUNT = val;
+        for (int i = 0; i < MOTOR_COUNT; i++) motors[i] = motorPool[i];
+        SerialPort.Send("Motor count set to: ");
+        SerialPort.SendLine(MOTOR_COUNT);
+        return;
+    }
+
+    // ── RESET ──
+    if (cmd == "RESET") {
+        velocityRPM       = DEFAULT_RPM;
+        velocityMAX       = DEFAULT_RPM;
+        accelerationLimit = DEFAULT_ACCEL;
+        decelerationLimit = DEFAULT_DECEL;
+        offsets[0] = DEFAULT_PHASE_0;
+        offsets[1] = DEFAULT_PHASE_1;
+        offsets[2] = DEFAULT_PHASE_2;
+        offsets[3] = DEFAULT_PHASE_3;
+        int32_t sps  = (encoderResolution * velocityRPM) / 60;
+        int32_t sps2 = (encoderResolution * accelerationLimit) / 60;
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            motors[i]->VelMax(sps);
+            motors[i]->AccelMax(sps2);
+        }
+        SerialPort.SendLine("All settings reset to defaults.");
+        PrintStatus();
+        return;
+    }
+
+    // ── Unknown ──
+    SerialPort.Send("ERROR: Unknown command: ");
+    SerialPort.SendLine(cmd.c_str());
+}
+// -----------------------------------------------------------------------
 // setup(): Runs when the controller is powered up
 // -----------------------------------------------------------------------
 void setup() {
@@ -544,69 +685,70 @@ void setup() {
     SerialPort.SendLine("Configuring active motors...");
     ConfigureMotors();
 
-    SerialPort.SendLine("Commands: 'M'=Sync, 'P'=Phase, 'R'=Run, 'S'=Stop, 'G'=Home, 'E'=Enable, 'D'=Disable, 'A'=Alerts, 'H'=Handle Alerts, '?'=Status");
+    // Step 4: Print default configuration on startup
+    SerialPort.SendLine("----------------------------------------------");
+    SerialPort.SendLine("Default Configuration:");
+    SerialPort.Send("  RPM:   "); SerialPort.SendLine(velocityRPM);
+    SerialPort.Send("  Accel: "); SerialPort.SendLine(accelerationLimit);
+    SerialPort.Send("  Decel: "); SerialPort.SendLine(decelerationLimit);
+    SerialPort.Send("  Phase: ");
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        SerialPort.Send(offsets[i]);
+        if (i < MOTOR_COUNT - 1) SerialPort.Send(", ");
+    }
+    SerialPort.SendLine(" degrees");
+
+    // Step 5: Print available commands
+    SerialPort.SendLine("----------------------------------------------");
+    SerialPort.SendLine("Motion Commands:");
+    SerialPort.SendLine("  E = Enable motors");
+    SerialPort.SendLine("  D = Disable motors");
+    SerialPort.SendLine("  G = Home all motors");
+    SerialPort.SendLine("  P = Set phase angles");
+    SerialPort.SendLine("  R = Start rotation");
+    SerialPort.SendLine("  S = Stop all motors");
+    SerialPort.SendLine("  A = Print alerts");
+    SerialPort.SendLine("  H = Handle alerts");
+    SerialPort.SendLine("  ? = Print current config");
+    SerialPort.SendLine("----------------------------------------------");
+    SerialPort.SendLine("Config Commands:");
+    SerialPort.SendLine("  RPM:<value>            e.g. RPM:1500");
+    SerialPort.SendLine("  ACCEL:<value>          e.g. ACCEL:300");
+    SerialPort.SendLine("  DECEL:<value>          e.g. DECEL:150");
+    SerialPort.SendLine("  PHASE:m0,m1,m2,m3     e.g. PHASE:0,90.5,180,270");
+    SerialPort.SendLine("  MOTORS:<value>         e.g. MOTORS:3");
+    SerialPort.SendLine("  RESET                  Restore all defaults");
+    SerialPort.SendLine("----------------------------------------------");
+    SerialPort.SendLine("Sequence: E (Enable+Home+Sync) → P (Phase, optional) → R (Run) → S (Stop)");
     SerialPort.SendLine("----------------------------------------------");
 }
 
 void loop() {
-    // 1: Listen to Serial Commands to trigger functions
-    if (SerialPort.AvailableForRead() > 0){
-        char cmd = SerialPort.CharGet();
-        switch(cmd){
-            case 'M': case 'm': 
-                SerialPort.SendLine("----Manual Synchronization Command Initialized----");
-                ManualSyncZero(); 
-                break;
-            case 'D': case 'd': 
-                SerialPort.SendLine("----Disable All Motors Command Initialized----");
-                DisableAllMotors(); 
-                break;
-            case 'E': case 'e': 
-                SerialPort.SendLine("----Enable All Motors Command Initialized----");
-                EnableAllMotors(); 
-                break;
-            case 'P': case 'p': 
-                SerialPort.SendLine("----Set Phase Offsets Command Initialized----");
-                SetPhaseAngles(offsets); 
-                break;
-            case 'R': case 'r': 
-                SerialPort.SendLine("----Start Rotation Command Initialized----");
-                StartRotation(velocityRPM); 
-                break;
-            case 'S': case 's': 
-                SerialPort.SendLine("----Stop All Motors Command Initialized----");
-                StopAll();
-                break;
-            case 'G': case 'g': 
-                SerialPort.SendLine("----Move Motors To Targets Command Initialized----");
-                HomeAllMotors(); 
-                break;
-            case 'A': case 'a':
-                SerialPort.SendLine("----Print Alerts Command Initialized----");
-                PrintAlerts();
-                break;
-            case 'H': case 'h':
-                SerialPort.SendLine("----Handle Alerts Command Initialized----");
-                HandleAlerts();
-                break;    
-            case '?':
-                switch (systemState) {
-                    case STATE_IDLE:      SerialPort.SendLine("State: IDLE - Command 'M' to sync"); break;
-                    case STATE_SYNCED:    SerialPort.SendLine("State: SYNCED - Command 'P' to set phase"); break;
-                    case STATE_PHASE_SET: SerialPort.SendLine("State: PHASE SET - Command 'R' to run"); break;
-                    case STATE_RUNNING:   SerialPort.SendLine("State: RUNNING - Command 'S' to stop"); break;
-                    case STATE_HOMED:     SerialPort.SendLine("State: HOMED - Command 'M' to sync"); break;
-                }
-                break;
+    // 1: Buffered serial read — supports single-char and multi-char commands
+    if (SerialPort.AvailableForRead() > 0) {
+        char c = SerialPort.CharGet();
+        if (c == '\n' || c == '\r') {
+            serialBuffer.trim();
+            if (serialBuffer.length() > 0) {
+                processCommand(serialBuffer);
+                serialBuffer = "";
             }
+        } else {
+            serialBuffer += c;
+        }
     }
 
-    // 2: Continuous Monitoring (Only when motors are at the desired speed)
-    if (!AllMotorsStationary() && motorsRunning){
-        if (!AllMotorsInRange()){
-            SerialPort.SendLine("CRITICAL: Synchronization lost or motor stalled!");
-            PrintAlerts();
-            StopAll(); // safety action, stop the motors when they are not synchronizing 
+    // 2: Continuous Monitoring (Only when motors are running)
+    static uint32_t lastRangeWarn = 0;
+    if (!AllMotorsStationary() && motorsRunning) {
+        if (!AllMotorsInRange()) {
+            // Returns false at least every 1 seconds, rather than keep spamming false
+            if (Milliseconds() - lastRangeWarn > 1000){
+                SerialPort.SendLine("CRITICAL: Synchronization lost or motor stalled!");
+                PrintAlerts();
+                lastRangeWarn = Milliseconds();
+            }
+            StopAll();
         }
     }
 }
