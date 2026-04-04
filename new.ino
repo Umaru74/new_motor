@@ -37,6 +37,7 @@ const int32_t baudRate          = 115200; // needs to match with host computer U
 #define DEFAULT_PHASE_2 140.4f // in degrees, 3120 counts 
 #define DEFAULT_PHASE_3 0.0f // in degrees, 0 counts 
 
+
 // -----------------------------------------------------------------------
 // Runtime configuration — changeable via serial
 // -----------------------------------------------------------------------
@@ -45,6 +46,16 @@ int32_t  velocityMAX       = DEFAULT_RPM;
 uint32_t accelerationLimit = DEFAULT_ACCEL;
 uint32_t decelerationLimit = DEFAULT_DECEL;
 float    offsets[4]        = {DEFAULT_PHASE_0, DEFAULT_PHASE_1, DEFAULT_PHASE_2, DEFAULT_PHASE_3};
+
+// for HLFBFaultDensity()
+int32_t HLFB_fault_limit = 10; // Default: 10 errors allowed per window
+uint32_t fault_window_ms = 1000; // 1 second window
+uint32_t last_fault_reset_time = 0;
+int32_t motor_fault_counts[4] = {0, 0, 0, 0};
+
+// for HLFB Consecutive Fault Tracking
+int32_t consecutive_fault_counts[4] = {0, 0, 0, 0};
+int32_t MAX_CONSECUTIVE_FAULTS = 50; // Adjust based on your loop frequency
 
 // Serial buffer for multi-char commands
 String serialBuffer = "";
@@ -526,6 +537,56 @@ bool AllMotorsInRange(){
         }
     }
     return true; // All motors are physically at 2000 RPM (within tolerance)
+}
+
+bool HLFBFaultDensity() {
+    // Reset counts every 1 second
+    if (Milliseconds() - last_fault_reset_time >= fault_window_ms) {
+        for (int i = 0; i < 4; i++) motor_fault_counts[i] = 0;
+        last_fault_reset_time = Milliseconds();
+    }
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        // If HLFB is NOT asserted (meaning out of range/error)
+        if (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
+            motor_fault_counts[i]++;
+            
+            // Check if this motor has exceeded the allowed density
+            if (motor_fault_counts[i] > HLFB_fault_limit) {
+                SerialPort.Send("CRITICAL: Fault density exceeded on Motor M");
+                SerialPort.SendLine(i);
+                return false; 
+            }
+        }
+    }
+    return true; 
+}
+
+// HLFB mode 
+bool checkHLFBConsecutiveError() {
+    bool system_ok = true;
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        // HLFB_ASSERTED means the motor is in-range/healthy
+        if (motors[i]->HlfbState() != MotorDriver::HLFB_ASSERTED) {
+            consecutive_fault_counts[i]++;
+            
+            // If the streak is too long, flag a failure
+            if (consecutive_fault_counts[i] >= MAX_CONSECUTIVE_FAULTS) {
+                SerialPort.Send("CRITICAL: Motor M");
+                SerialPort.Send(i);
+                SerialPort.Send(" failed HLFB for ");
+                SerialPort.Send(MAX_CONSECUTIVE_FAULTS);
+                SerialPort.SendLine(" consecutive cycles.");
+                system_ok = false;
+            }
+        } else {
+            // IMPORTANT: Reset the counter if the motor is healthy
+            // This is what makes it "consecutive" rather than "cumulative"
+            consecutive_fault_counts[i] = 0;
+        }
+    }
+    return system_ok;
 }
 
 // -----------------------------------------------------------------------
